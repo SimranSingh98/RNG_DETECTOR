@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.pyc
+
+# Windows binaries
+*.exe
+*.dll
+*.obj
+*.lib
+
+# Disassembly / generated analysis output
+*.txt
+
+# Python virtual environments
+.venv/
+venv/
+
+# IDE
+.vscode/
+
+# Temporary files
+*.tmp
+*.log
+
+# OS
+Thumbs.db
+.DS_Store
