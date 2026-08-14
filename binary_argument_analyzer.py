@@ -312,37 +312,117 @@ class SymbolicState:
 
     def __init__(self):
 
-        self.registers = {}
+        # --------------------------------------------------------
+        # Symbolic value of registers
+        # --------------------------------------------------------
+
+        self.registers = {
+            "RCX": "ARG1",
+            "RDX": "ARG2",
+            "R8":  "ARG3",
+            "R9":  "ARG4",
+        }
+
+        # --------------------------------------------------------
+        # Symbolic value of stack memory
+        # --------------------------------------------------------
 
         self.memory = {}
+
+        # --------------------------------------------------------
+        # Stack frame offset from caller's pre-CALL RSP
+        # --------------------------------------------------------
+
+        self.frame_delta = 0
+
+        # --------------------------------------------------------
+        # Caller's symbolic state for cross-frame resolution
+        # --------------------------------------------------------
+
+        self.caller_state = None
+
+        # --------------------------------------------------------
+        # Provenance / history
+        #
+        # Example:
+        #
+        # RDX:
+        #     ARG1
+        #     -> RCX
+        #     -> [RSP+0x30]
+        #     -> RDX
+        # --------------------------------------------------------
+
+        self.register_history = {
+            "RCX": ["ARG1"],
+            "RDX": ["ARG2"],
+            "R8":  ["ARG3"],
+            "R9":  ["ARG4"],
+        }
+
+        self.memory_history = {}
 
     # --------------------------------------------------------
     # REGISTER
     # --------------------------------------------------------
 
-    def set_reg(self, reg, value):
+    def set_reg(self, reg, value, history=None):
 
         reg = normalize_register(reg)
 
         self.registers[reg] = value
 
+        if history is None:
+
+            history = [value]
+
+        self.register_history[reg] = history
+
     def get_reg(self, reg):
 
         reg = normalize_register(reg)
 
-        return self.registers.get(reg, "UNKNOWN")
+        return self.registers.get(
+            reg,
+            "UNKNOWN"
+        )
+
+    def get_reg_history(self, reg):
+
+        reg = normalize_register(reg)
+
+        return self.register_history.get(
+            reg,
+            ["UNKNOWN"]
+        )
 
     # --------------------------------------------------------
     # MEMORY
     # --------------------------------------------------------
 
-    def set_mem(self, location, value):
+    def set_mem(self, location, value, history=None):
 
         self.memory[location] = value
 
+        if history is None:
+
+            history = [value]
+
+        self.memory_history[location] = history
+
     def get_mem(self, location):
 
-        return self.memory.get(location, "UNKNOWN")
+        return self.memory.get(
+            location,
+            "UNKNOWN"
+        )
+
+    def get_mem_history(self, location):
+
+        return self.memory_history.get(
+            location,
+            ["UNKNOWN"]
+        )
 
     # --------------------------------------------------------
     # DEBUG
@@ -362,10 +442,55 @@ class SymbolicState:
 
         for reg in regs:
 
+            value = self.get_reg(reg)
+
             print(
-                f"{reg:<5}= {self.get_reg(reg)}"
+                f"{reg:<5}= {value}"
             )
 
+    # --------------------------------------------------------
+    # PROVENANCE DEBUG
+    # --------------------------------------------------------
+
+    def dump_provenance(self):
+
+        print("\nREGISTER PROVENANCE")
+        print("-" * 70)
+
+        regs = [
+            "RCX",
+            "RDX",
+            "R8",
+            "R9",
+            "RSI",
+            "RDI",
+            "RAX"
+        ]
+
+        for reg in regs:
+
+            history = self.get_reg_history(reg)
+
+            print(
+                f"{reg:<5}= "
+                + " -> ".join(history)
+            )
+
+        print("\nMEMORY PROVENANCE")
+        print("-" * 70)
+
+        if not self.memory_history:
+
+            print("No tracked memory provenance.")
+
+            return
+
+        for location, history in self.memory_history.items():
+
+            print(
+                f"{location:<15}= "
+                + " -> ".join(history)
+            )
 
 # ============================================================
 # OPERAND HELPERS
@@ -403,36 +528,50 @@ def is_register(op):
 def memory_location(op):
 
     """
-    Convert:
+    Convert memory operands with register base:
 
-        0x30(%rsp)
-
-    into:
-
-        [RSP+0x30]
+        (%rax)      -> [RAX]
+        0x8(%rax)   -> [RAX+0x8]
+        -0x10(%rcx) -> [RCX-0x10]
     """
 
     op = op.strip()
 
+    # Match: optional_offset(register)
+    # Groups: (1) optional offset, (2) register name
     m = re.match(
-        r"(-?0x[0-9a-fA-F]+|-?\d+)\(%rsp\)",
+        r"(-?0x[0-9a-fA-F]+|-?\d+)?\(%([a-z0-9]+)\)",
         op
     )
 
-    if m:
+    if not m:
+        return None
 
-        offset = parse_immediate(m.group(1))
+    offset_str = m.group(1)
+    reg_name = m.group(2)
 
-        if offset is None:
-            return None
+    # Normalize the register
+    reg = normalize_register("%" + reg_name)
 
-        if offset >= 0:
+    # Validate it's a real register
+    if not is_register(reg):
+        return None
 
-            return f"[RSP+0x{offset:X}]"
+    # No offset
+    if offset_str is None:
+        return f"[{reg}]"
 
-        return f"[RSP-0x{-offset:X}]"
+    # Parse offset
+    offset = parse_immediate(offset_str)
 
-    return None
+    if offset is None:
+        return None
+
+    # Format with offset
+    if offset >= 0:
+        return f"[{reg}+0x{offset:X}]"
+    else:
+        return f"[{reg}-0x{-offset:X}]"
 
 # ============================================================
 # SYMBOLIC OPERAND VALUE
@@ -459,7 +598,62 @@ def resolve_operand(op, state):
 
     if mem:
 
-        return state.get_mem(mem)
+        value = state.get_mem(mem)
+
+        # ------------------------------------------------
+        # If not found and RSP-relative, try translated
+        # location in caller's frame (cross-frame resolution)
+        # ------------------------------------------------
+
+        if value == "UNKNOWN" and state.frame_delta != 0 and state.caller_state is not None:
+
+            translated_mem = translate_rsp_memory_location(
+                mem,
+                state.frame_delta
+            )
+
+            if translated_mem is not None:
+
+                caller_value = state.caller_state.get_mem(translated_mem)
+
+                if caller_value != "UNKNOWN":
+
+                    # print(
+                    #     f"DEBUG CROSS-FRAME RESOLVE: "
+                    #     f"operand={mem}, "
+                    #     f"frame_delta=0x{state.frame_delta:X}, "
+                    #     f"caller_location={translated_mem}, "
+                    #     f"caller_value={caller_value}"
+                    # )
+
+                    value = caller_value
+
+                else:
+
+                    print(
+                        f"DEBUG FRAME LOOKUP: "
+                        f"{mem} -> {translated_mem}, "
+                        f"frame_delta=0x{state.frame_delta:X} (not in caller)"
+                    )
+
+        elif value == "UNKNOWN" and state.frame_delta != 0:
+
+            translated_mem = translate_rsp_memory_location(
+                mem,
+                state.frame_delta
+            )
+
+            if translated_mem is not None:
+
+                print(
+                    f"DEBUG FRAME LOOKUP: "
+                    f"{mem} -> {translated_mem}, "
+                    f"frame_delta=0x{state.frame_delta:X}"
+                )
+
+                value = state.get_mem(translated_mem)
+
+        return value
 
     return "UNKNOWN"
 
@@ -524,21 +718,78 @@ def process_instruction(ins, state):
         src = operands[0]
         dst = operands[1]
 
-        value = resolve_operand(src, state)
+        value = resolve_operand(
+            src,
+            state
+        )
 
-        # destination register
+        # ----------------------------------------------------
+        # Get provenance of source
+        # ----------------------------------------------------
+
+        if is_register(src):
+
+            history = state.get_reg_history(src).copy()
+
+        else:
+
+            mem = memory_location(src)
+
+            if mem:
+
+                history = state.get_mem_history(mem).copy()
+
+            else:
+
+                imm = parse_immediate(src)
+
+                if imm is not None:
+
+                    history = [
+                        f"IMM({src})"
+                    ]
+
+                else:
+
+                    history = [
+                        "UNKNOWN"
+                    ]
+
+        # ----------------------------------------------------
+        # Add destination to provenance
+        # ----------------------------------------------------
+
         if is_register(dst):
 
-            state.set_reg(dst, value)
+            new_history = history + [
+                normalize_register(dst)
+            ]
+
+            state.set_reg(
+                dst,
+                value,
+                new_history
+            )
 
             return
 
-        # destination memory
+        # ----------------------------------------------------
+        # Destination memory
+        # ----------------------------------------------------
+
         mem = memory_location(dst)
 
         if mem:
 
-            state.set_mem(mem, value)
+            new_history = history + [
+                mem
+            ]
+
+            state.set_mem(
+                mem,
+                value,
+                new_history
+            )
 
             return
 
@@ -558,9 +809,17 @@ def process_instruction(ins, state):
 
         if mem:
 
+            value = "&" + mem
+
+            history = [
+                mem,
+                normalize_register(dst)
+            ]
+
             state.set_reg(
                 dst,
-                "&" + mem
+                value,
+                history
             )
 
         return
@@ -790,6 +1049,340 @@ def find_api_calls(instructions, thunks, imports):
 
 
 # ============================================================
+# FUNCTION PROLOGUE ANALYSIS
+# ============================================================
+
+def calculate_function_frame_delta(instructions, function_start):
+
+    """
+    Calculate the stack-frame adjustment from a function's prologue.
+
+    Scans the first ~20 instructions at function_start, looking for:
+        pushq <register>      -> +8 bytes
+        subq $IMM, %rsp       -> +IMM bytes
+
+    Does NOT include the CALL instruction's implicit return-address push.
+
+    Returns:
+        Total prologue delta (in bytes), or 0 if function_start not found.
+    """
+
+    # --------------------------------------------------------
+    # Find the instruction with address == function_start
+    # --------------------------------------------------------
+
+    start_index = None
+
+    for i, ins in enumerate(instructions):
+
+        if ins["address"] == function_start:
+
+            start_index = i
+            break
+
+    if start_index is None:
+
+        return 0
+
+    # --------------------------------------------------------
+    # Scan the first ~20 instructions from start
+    # --------------------------------------------------------
+
+    delta = 0
+
+    for i in range(start_index, min(start_index + 20, len(instructions))):
+
+        ins = instructions[i]
+
+        asm = ins["asm"]
+
+        # Remove comments
+        asm = asm.split("#")[0].strip()
+
+        if not asm:
+            continue
+
+        parts = asm.split(None, 1)
+
+        if len(parts) < 1:
+            continue
+
+        mnemonic = parts[0].lower()
+
+        operands = []
+
+        if len(parts) == 2:
+
+            operands = [
+                x.strip()
+                for x in parts[1].split(",")
+            ]
+
+        # ------------------------------------------------
+        # Recognize: pushq <register>
+        # ------------------------------------------------
+
+        if mnemonic == "pushq":
+
+            if len(operands) >= 1:
+
+                reg = normalize_register(operands[0])
+
+                if is_register(reg):
+
+                    delta += 8
+                    continue
+
+            # If not a recognized pushq, stop prologue
+            break
+
+        # ------------------------------------------------
+        # Recognize: subq $IMM, %rsp
+        # ------------------------------------------------
+
+        if mnemonic == "subq":
+
+            if len(operands) == 2:
+
+                src = operands[0]
+                dst = operands[1]
+
+                dst_reg = normalize_register(dst)
+
+                if dst_reg == "RSP":
+
+                    imm = parse_immediate(src)
+
+                    if imm is not None and imm > 0:
+
+                        delta += imm
+                        continue
+
+            # If not a recognized subq, stop prologue
+            break
+
+        # ------------------------------------------------
+        # Any other instruction ends the prologue
+        # ------------------------------------------------
+
+        break
+
+    return delta
+
+
+# ============================================================
+# FUNCTION CONTAINMENT
+# ============================================================
+
+def find_containing_function(instructions, target_address, function_starts):
+
+    """
+    Determine which function contains a given instruction address.
+
+    Finds the largest function_start such that:
+        function_start <= target_address
+
+    Args:
+        instructions: list of instruction dicts with 'address' field
+        target_address: address to locate
+        function_starts: collection of known function entry addresses
+
+    Returns:
+        Largest function_start <= target_address, or None if not found.
+    """
+
+    # --------------------------------------------------------
+    # Filter to valid function starts
+    # --------------------------------------------------------
+
+    valid_starts = [
+        addr for addr in function_starts
+        if addr <= target_address
+    ]
+
+    if not valid_starts:
+
+        return None
+
+    # --------------------------------------------------------
+    # Return the largest one
+    # --------------------------------------------------------
+
+    return max(valid_starts)
+
+
+# ============================================================
+# FIND DIRECT CALLER
+# ============================================================
+
+def find_direct_callers(instructions, target_function, function_starts):
+
+    """
+    Find direct callers of a target function.
+
+    Scans all callq instructions, and for each one targeting target_function,
+    identifies the caller function and call site.
+
+    Args:
+        instructions: list of instruction dicts with 'address' and 'asm'
+        target_function: the function address being called
+        function_starts: collection of known function entry addresses
+
+    Returns:
+        List of tuples: [(caller_function, call_site), ...]
+        Returns empty list if no direct callers found.
+    """
+
+    callers = []
+
+    # --------------------------------------------------------
+    # Scan all instructions for direct callq
+    # --------------------------------------------------------
+
+    for ins in instructions:
+
+        asm = ins["asm"].split("#")[0].strip()
+
+        if not asm.startswith("callq"):
+
+            continue
+
+        # Extract target address from callq
+        m = re.search(
+            r"callq\s+0x([0-9a-fA-F]+)",
+            asm
+        )
+
+        if not m:
+
+            continue
+
+        target = int(m.group(1), 16)
+
+        # Check if this call targets our target_function
+        if target != target_function:
+
+            continue
+
+        # Found a direct call to target_function
+        call_site = ins["address"]
+
+        # Find the function containing this call
+        caller_func = find_containing_function(
+            instructions,
+            call_site,
+            function_starts
+        )
+
+        if caller_func is not None:
+
+            callers.append((caller_func, call_site))
+
+    return callers
+
+
+# ============================================================
+# RSP MEMORY TRANSLATION
+# ============================================================
+
+def translate_rsp_memory_location(location, frame_delta):
+
+    """
+    Translate an RSP-relative memory location from a callee's frame
+    back to the caller's pre-CALL frame.
+
+    The calculation is:
+        translated_offset = original_offset - frame_delta
+
+    Args:
+        location: Memory location string, e.g., "[RSP+0x1F0]"
+        frame_delta: Stack frame delta (positive, in bytes)
+
+    Returns:
+        Translated location string, or None if not RSP-relative or malformed.
+
+    Examples:
+        translate_rsp_memory_location("[RSP+0x1F0]", 0x1D0) -> "[RSP+0x20]"
+        translate_rsp_memory_location("[RSP+0x20]", 0x10)   -> "[RSP+0x10]"
+        translate_rsp_memory_location("[RSP+0x10]", 0x20)   -> "[RSP-0x10]"
+        translate_rsp_memory_location("[RAX+0x10]", 0x20)   -> None
+    """
+
+    location = location.strip()
+
+    # --------------------------------------------------------
+    # Match: [REGISTER+offset] or [REGISTER-offset] or [REGISTER]
+    # --------------------------------------------------------
+
+    m = re.match(
+        r"^\[([A-Z0-9]+)(([+-])0x[0-9A-F]+)?\]$",
+        location
+    )
+
+    if not m:
+
+        return None
+
+    reg_name = m.group(1)
+
+    # --------------------------------------------------------
+    # Only handle RSP
+    # --------------------------------------------------------
+
+    if reg_name != "RSP":
+
+        return None
+
+    # --------------------------------------------------------
+    # Parse the offset
+    # --------------------------------------------------------
+
+    offset_str = m.group(2)
+
+    if offset_str is None:
+
+        # [RSP] -> offset is 0
+        offset = 0
+
+    else:
+
+        # offset_str is something like "+0x1F0" or "-0x10"
+        try:
+
+            offset = int(offset_str.replace("+", ""), 16)
+
+            if offset_str.startswith("-"):
+
+                offset = -offset
+
+        except ValueError:
+
+            return None
+
+    # --------------------------------------------------------
+    # Translate: new_offset = offset - frame_delta
+    # --------------------------------------------------------
+
+    new_offset = offset - frame_delta
+
+    # --------------------------------------------------------
+    # Format the result
+    # --------------------------------------------------------
+
+    if new_offset == 0:
+
+        return "[RSP]"
+
+    elif new_offset > 0:
+
+        return f"[RSP+0x{new_offset:X}]"
+
+    else:
+
+        return f"[RSP-0x{-new_offset:X}]"
+
+
+# ============================================================
 # SYMBOLIC ANALYSIS AROUND CALL
 # ============================================================
 
@@ -797,10 +1390,104 @@ def analyze_call(
     instructions,
     call_index,
     call,
-    window=30
+    window=100,
+    populate_caller=True
 ):
 
     state = SymbolicState()
+
+    # --------------------------------------------------------
+    # Calculate frame delta for the function containing this
+    # call, so that RSP-relative memory lookups can be
+    # translated to the caller's frame.
+    # --------------------------------------------------------
+
+    call_address = call.get("address")
+
+    if call_address is not None:
+
+        # Extract function entry points from CALL targets
+        function_starts = set()
+
+        for ins in instructions:
+
+            asm = ins["asm"].split("#")[0].strip()
+
+            if asm.startswith("callq"):
+
+                m = re.search(
+                    r"callq\s+0x([0-9a-fA-F]+)",
+                    asm
+                )
+
+                if m:
+
+                    function_starts.add(
+                        int(m.group(1), 16)
+                    )
+
+        # Find the function containing this call
+        containing_func = find_containing_function(
+            instructions,
+            call_address,
+            function_starts
+        )
+
+        if containing_func is not None:
+
+            prologue_delta = calculate_function_frame_delta(
+                instructions,
+                containing_func
+            )
+
+            # Total delta = prologue + CALL's implicit push
+            state.frame_delta = prologue_delta + 8
+
+            # ------------------------------------------------
+            # Populate caller_state for cross-frame resolution
+            # (only if populate_caller=True to prevent infinite
+            # recursion)
+            # ------------------------------------------------
+
+            if populate_caller:
+
+                callers = find_direct_callers(
+                    instructions,
+                    containing_func,
+                    function_starts
+                )
+
+                if callers:
+
+                    caller_func, caller_call_site = callers[0]
+
+                    # Find the index of the caller's CALL instruction
+                    caller_call_index = None
+
+                    for idx, ins in enumerate(instructions):
+
+                        if ins.get("address") == caller_call_site:
+
+                            caller_call_index = idx
+                            break
+
+                    if caller_call_index is not None:
+
+                        # Create a dummy call dict for the caller analysis
+                        caller_call_dict = {
+                            "address": caller_call_site,
+                            "api": f"CALLER_OF_0x{containing_func:X}"
+                        }
+
+                        # Analyze the caller's state at its CALL site
+                        # Pass populate_caller=False to prevent infinite recursion
+                        state.caller_state = analyze_call(
+                            instructions,
+                            caller_call_index,
+                            caller_call_dict,
+                            window=100,
+                            populate_caller=False
+                        )
 
     start = max(
         0,
@@ -821,6 +1508,8 @@ def analyze_call(
 
     state.dump_registers()
 
+    state.dump_provenance()
+
     print("\nMEMORY STATE")
     print("-" * 70)
 
@@ -838,6 +1527,83 @@ def analyze_call(
 
     return state
 
+# ============================================================
+# RNG API SEMANTIC ANALYSIS
+# ============================================================
+
+def analyze_rng_api(call, state):
+    """
+    Interpret arguments for supported RNG APIs.
+
+    Currently supported:
+        BCryptGenRandom
+
+    Windows x64 calling convention:
+
+        RCX = argument 1
+        RDX = argument 2
+        R8  = argument 3
+        R9  = argument 4
+
+    BCryptGenRandom signature:
+
+        BCryptGenRandom(
+            BCRYPT_ALG_HANDLE hAlgorithm,
+            PUCHAR            pbBuffer,
+            ULONG             cbBuffer,
+            ULONG             dwFlags
+        );
+    """
+
+    api = call.get("api", "")
+
+    if api != "BCryptGenRandom":
+        return
+
+    # --------------------------------------------------------
+    # Read the symbolic values produced by our existing
+    # instruction analysis.
+    # --------------------------------------------------------
+
+    h_algorithm = state.get_reg("RCX")
+    buffer_ptr = state.get_reg("RDX")
+    buffer_size = state.get_reg("R8")
+    flags = state.get_reg("R9")
+
+    print()
+    print("=" * 70)
+    print("BCryptGenRandom ARGUMENT ANALYSIS")
+    print("=" * 70)
+
+    print()
+    print(f"CALL SITE        : 0x{call['address']:x}")
+
+    print()
+    print("Windows x64 arguments")
+    print("-" * 70)
+
+    print(f"RCX / hAlgorithm : {h_algorithm}")
+    print(f"RDX / pbBuffer   : {buffer_ptr}")
+    print(f"R8  / cbBuffer   : {buffer_size}")
+    print(f"R9  / dwFlags    : {flags}")
+
+    # --------------------------------------------------------
+    # Interpret the known values.
+    # --------------------------------------------------------
+
+    print()
+    print("Interpretation")
+    print("-" * 70)
+
+    if h_algorithm == "0":
+        print("Algorithm handle : NULL")
+        print("RNG selection    : System-preferred RNG")
+    else:
+        print(f"Algorithm handle : {h_algorithm}")
+
+    print(f"Output buffer    : {buffer_ptr}")
+    print(f"Output size      : {buffer_size} bytes")
+    print(f"Flags            : {flags}")
 
 # ============================================================
 # MAIN
@@ -1006,6 +1772,24 @@ def main():
                 f"-> IAT 0x{iat:x} "
                 f"-> {entry}"
             )
+
+    # ========================================================
+    # DEBUG 4:
+    # FUNCTION FRAME DELTA
+    # ========================================================
+
+    frame_delta = calculate_function_frame_delta(
+        instructions,
+        0x140001040
+    )
+
+    print()
+    print("=" * 70)
+    print("DEBUG: FUNCTION FRAME")
+    print("=" * 70)
+    print("Function       : 0x140001040")
+    print(f"Frame delta    : 0x{frame_delta:X}")
+
 
     # ========================================================
     # SUMMARY
@@ -1310,7 +2094,7 @@ def main():
                 instructions,
                 call_index,
                 call,
-                window=30
+                window=100
             )
 
             # ------------------------------------------------
@@ -1338,52 +2122,21 @@ def main():
             )
 
             # ------------------------------------------------
-            # API-specific interpretation for BCryptGenRandom.
+            # API-specific semantic analysis.
             #
-            # BCryptGenRandom(
-            #     BCRYPT_ALG_HANDLE hAlgorithm,
-            #     PUCHAR           pbBuffer,
-            #     ULONG            cbBuffer,
-            #     ULONG            dwFlags
-            # )
+            # For BCryptGenRandom this interprets:
             #
-            # We intentionally keep the values symbolic rather
-            # than claiming that an unknown value is a concrete
-            # pointer.
+            # RCX -> hAlgorithm
+            # RDX -> pbBuffer
+            # R8  -> cbBuffer
+            # R9  -> dwFlags
             # ------------------------------------------------
 
-            if call["api"] == "BCryptGenRandom":
+            analyze_rng_api(
+                call,
+                state
+            )
 
-                print()
-                print("BCryptGenRandom ARGUMENTS")
-                print("-" * 70)
-
-                print(
-                    f"hAlgorithm = "
-                    f"{state.get_reg('RCX')}"
-                )
-
-                print(
-                    f"pbBuffer   = "
-                    f"{state.get_reg('RDX')}"
-                )
-
-                print(
-                    f"cbBuffer   = "
-                    f"{state.get_reg('R8')}"
-                )
-
-                print(
-                    f"dwFlags    = "
-                    f"{state.get_reg('R9')}"
-                )
-
-                print()
-                print(
-                    "Note: Values such as &memory or "
-                    "[RSP+offset] are symbolic locations, "
-                    "not dereferenced memory contents."
-                )
 
     # ========================================================
     # COMPLETE
